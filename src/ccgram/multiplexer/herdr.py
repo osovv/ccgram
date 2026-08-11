@@ -254,10 +254,20 @@ class HerdrLiveRecord:
     tab_id: str
     workspace_id: str
     alias_target_ids: tuple[str, ...] = ()
+    cwd: str = ""
 
 
 def _session_field(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _record_cwd(record: Mapping[str, object]) -> str:
+    """Return the agent record's working directory for topic discovery."""
+    for key in ("cwd", "foreground_cwd"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _session_composite(record: Mapping[str, object]) -> HerdrSessionComposite | None:
@@ -348,6 +358,7 @@ def _parse_live_record(record: Mapping[str, object]) -> HerdrLiveRecord | None:
         tab_id=locators["tab_id"] or "",
         workspace_id=locators["workspace_id"] or "",
         alias_target_ids=() if alias_id == target_id else (alias_id,),
+        cwd=_record_cwd(record),
     )
 
 
@@ -697,7 +708,7 @@ class HerdrManager:
         return WindowRef(
             window_id=record.target_id,
             window_name=label,
-            cwd="",
+            cwd=record.cwd,
             pane_current_command=record.composite.agent,
             alias_window_ids=record.alias_target_ids,
         )
