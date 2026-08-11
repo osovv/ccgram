@@ -63,7 +63,7 @@ Each Telegram topic maps to one tmux window. With Herdr, it maps instead to one 
 ## What You Can Do
 
 - **Bind agents to topics** — one agent per group or private-chat topic; create via directory browser
-- **Auto-detect providers** — Supports Claude Code, Codex, Gemini, Pi, and Shell simultaneously
+- **Auto-detect providers** — Supports Claude Code, Codex, Gemini, Pi, Antigravity, OpenCode, and Shell simultaneously
 - **Monitor live** — Terminal screenshots on demand or auto-refresh every 5 seconds
 - **Send commands** — Slash commands, voice messages (transcribed via Whisper), or raw shell input
 - **Run multiple agents in parallel** — each topic independent; run different agents at once
@@ -120,7 +120,7 @@ Get your user ID from [@userinfobot](https://t.me/userinfobot). For a group, get
 ccgram
 ```
 
-Open the configured group or private bot chat. Create a topic and send a message. The directory browser appears. Pick a project directory and an agent (Claude, Codex, Gemini, Pi, or Shell).
+Open the configured group or private bot chat. Create a topic and send a message. The directory browser appears. Pick a project directory and an agent (Claude, Codex, Gemini, Pi, Antigravity, OpenCode, or Shell).
 
 **Prerequisites:** Python 3.14+, [tmux](https://github.com/tmux/tmux), [herdr](https://github.com/ogulcancelik/herdr), or [agterm](https://github.com/umputun/agterm), and one agent CLI. CCGram does not modify agent SDKs.
 
@@ -158,7 +158,7 @@ Native Windows does not provide the Unix file locking, signal handling, and term
 ## Documentation
 
 - **[Guides](docs/guides.md)** — CLI reference, configuration, delivery/backlog safety, `/sync`, voice transcription, multi-instance setup, session recovery, testing
-- **[Providers](docs/providers.md)** — Claude Code, Codex, Gemini, Pi, Shell; transcript delivery, session modes, LLM config, custom commands, git worktrees
+- **[Providers](docs/providers.md)** — Claude Code, Codex, Gemini, Pi, Antigravity, OpenCode, Shell; transcript delivery, session modes, LLM config, custom commands, git worktrees
 - **[Architecture](docs/architecture.md)** — delivery queue, transcript watermark, and provider/three-backend multiplexer design
 
 ---
