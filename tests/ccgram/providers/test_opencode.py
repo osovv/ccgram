@@ -440,6 +440,138 @@ class TestTranscriptReading:
         entries, offset = provider.read_transcript_file(str(mirror), 7)
         assert entries == [] and offset == 7
 
+    def test_restart_emits_tool_result_that_settled_after_a_restart(
+        self, provider_env: tuple
+    ) -> None:
+        """A tool result arriving after a restart must still be emitted.
+
+        The mirror is rebuilt into in-memory markers on the next provider
+        instance; a part that was mirrored as ``use`` (still running) must
+        keep the ``result`` bit clear, otherwise the terminal tool result is
+        skipped as if it had already been relayed.
+        """
+        provider, db, mirror_root = provider_env
+        conn = _seed_session(db, "ses_1")
+        # user message + a tool call that is only running right now
+        _insert_event(
+            conn,
+            "ses_1",
+            1,
+            "message.updated.1",
+            _message_event("ses_1", "msg_user", "user"),
+        )
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?, ?, ?)",
+            ("msg_user", "ses_1", json.dumps({"role": "user"})),
+        )
+        _insert_event(
+            conn,
+            "ses_1",
+            2,
+            "message.part.updated.1",
+            _part_event(
+                "ses_1",
+                {
+                    "id": "prt_tool",
+                    "sessionID": "ses_1",
+                    "messageID": "msg_user",
+                    "type": "tool",
+                    "callID": "call_1",
+                    "tool": "bash",
+                    "state": {"status": "running", "input": {"command": "ls"}},
+                },
+            ),
+        )
+        conn.commit()
+        mirror = mirror_root / "ses_1.jsonl"
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        mirror.write_text(
+            json.dumps(
+                {"type": "session_meta", "session_id": "ses_1", "cwd": "/tmp/repo"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # First instance: mirrors the running tool as a use.
+        entries, offset = provider.read_transcript_file(str(mirror), 0)
+        use_msgs, pending = provider.parse_transcript_entries(entries, {})
+        assert any(m.content_type == "tool_use" for m in use_msgs)
+        assert offset == 2
+
+        # Simulate a restart: a brand-new provider rebuilds markers from the
+        # mirror, then the tool settles while the process is down.
+        conn.execute(
+            "UPDATE message SET data = ? WHERE id = 'msg_user'",
+            (json.dumps({"role": "assistant"}),),
+        )
+        _insert_event(
+            conn,
+            "ses_1",
+            3,
+            "message.part.updated.1",
+            _part_event(
+                "ses_1",
+                {
+                    "id": "prt_tool",
+                    "sessionID": "ses_1",
+                    "messageID": "msg_user",
+                    "type": "tool",
+                    "callID": "call_1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "ls"},
+                        "output": "total 42",
+                    },
+                },
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        restarted = _provider(db, mirror_root)
+        entries2, offset2 = restarted.read_transcript_file(str(mirror), offset)
+        result_msgs, _ = restarted.parse_transcript_entries(entries2, {})
+        # The result must not be skipped: it settles after the restart.
+        assert any(m.content_type == "tool_result" for m in result_msgs)
+        assert offset2 == 3
+
+        # And a second read must not duplicate the result.
+        entries3, offset3 = restarted.read_transcript_file(str(mirror), offset2)
+        assert entries3 == [] and offset3 == 3
+
+    def test_restart_does_not_reemit_already_mirrored_parts(
+        self, provider_env: tuple
+    ) -> None:
+        """A fresh provider instance must not duplicate settled messages."""
+        provider, db, mirror_root = provider_env
+        conn = _seed_session(db, "ses_1")
+        _seed_events(conn, "ses_1")
+        conn.close()
+        mirror = mirror_root / "ses_1.jsonl"
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        mirror.write_text(
+            json.dumps(
+                {"type": "session_meta", "session_id": "ses_1", "cwd": "/tmp/repo"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        entries, offset = provider.read_transcript_file(str(mirror), 0)
+        first_msgs, _ = provider.parse_transcript_entries(entries, {})
+        assert any(m.content_type == "tool_result" for m in first_msgs)
+
+        # Restart: new provider instance, cursor reset to the same offset.
+        restarted = _provider(db, mirror_root)
+        entries2, offset2 = restarted.read_transcript_file(str(mirror), 0)
+        messages2, _ = restarted.parse_transcript_entries(entries2, {})
+        # Discovery re-reads the whole log but markers rebuilt from the mirror
+        # suppress everything that was already relayed.
+        assert messages2 == []
+        assert offset2 == offset
+
     def _seed_big_session(self, db: Path, parts: int) -> None:
         conn = sqlite3.connect(db)
         conn.execute(

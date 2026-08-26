@@ -265,7 +265,13 @@ def _hit_entry_cap(max_entries: int | None, entries: list[dict[str, Any]]) -> bo
 
 
 def _scan_mirror_part_ids(mirror: Path) -> dict[str, int]:
-    """Re-read emitted-part markers from an existing mirror file (restart-safe)."""
+    """Re-read emitted-part markers from an existing mirror file (restart-safe).
+
+    Markers are derived from the part state *as it was when the line was
+    mirrored*, not blanket-marked as fully emitted: a line written while a
+    tool was still running only carries the ``use`` bit, so a ``result``
+    arriving after a restart is still emitted instead of being skipped.
+    """
     seen: dict[str, int] = {}
     if not mirror.exists():
         return seen
@@ -283,7 +289,8 @@ def _scan_mirror_part_ids(mirror: Path) -> dict[str, int]:
                     entry.get("part") if entry.get("type") == "opencode_part" else None
                 )
                 if isinstance(part, dict) and part.get("id"):
-                    seen[str(part["id"])] = _EMITTED_USE | _EMITTED_RESULT
+                    part_id = str(part["id"])
+                    seen[part_id] = seen.get(part_id, 0) | _desired_markers(part)
     except OSError:
         pass
     return seen
@@ -587,15 +594,22 @@ class OpenCodeProvider(JsonlProvider):
         entries, last_seq = _sync_opencode_events(
             session_id, last_offset, resolve_opencode_db_path()
         )
-        self._append_entries(mirror, session_id, entries)
+        emitted = self._append_entries(mirror, session_id, entries)
         self._bump_mtime(mirror)
-        return entries, last_seq
+        return emitted, last_seq
 
     def _append_entries(
         self, mirror: Path, session_id: str, entries: list[dict[str, Any]]
-    ) -> None:
+    ) -> list[dict[str, Any]]:
+        """Append not-yet-emitted entries to the mirror and return exactly those.
+
+        Returns only the entries that were mirrored for the first time, so a
+        re-read (restart, stale cursor, discovery after a state reset) cannot
+        hand already-relayed parts back to the delivery pipeline and duplicate
+        Telegram messages.
+        """
         if not entries:
-            return
+            return []
         seen = self._emitted_parts.get(session_id)
         if seen is None:
             if len(self._emitted_parts) >= _MAX_CACHED_SESSIONS:
@@ -603,18 +617,21 @@ class OpenCodeProvider(JsonlProvider):
             seen = _scan_mirror_part_ids(mirror)
             self._emitted_parts[session_id] = seen
         to_write: list[str] = []
+        emitted: list[dict[str, Any]] = []
         for entry in entries:
             line = _entry_line(seen, entry)
             if line is not None:
                 to_write.append(line)
+                emitted.append(entry)
         if not to_write:
-            return
+            return []
         try:
             with mirror.open("a", encoding="utf-8") as fh:
                 for line in to_write:
                     fh.write(line + "\n")
         except OSError as exc:
             logger.warning("opencode: mirror append failed %s: %s", mirror, exc)
+        return emitted
 
     @staticmethod
     def _bump_mtime(path: Path) -> None:
