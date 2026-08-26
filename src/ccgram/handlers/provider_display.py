@@ -4,6 +4,7 @@ PROVIDER_LABELS = {
     "claude": "Claude",
     "codex": "Codex",
     "gemini": "Gemini",
+    "opencode": "OpenCode",
     "pi": "Pi",
     "antigravity": "Antigravity",
     "shell": "Terminal",

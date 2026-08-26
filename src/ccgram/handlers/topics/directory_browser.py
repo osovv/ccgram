@@ -318,6 +318,7 @@ _PROVIDER_ICONS: dict[str, str] = {
     "claude": "\U0001f7e0",
     "codex": "\U0001f9e9",
     "gemini": "\u264a",
+    "opencode": "\U0001f7e2",
     "pi": "\U0001f916",
     "shell": "\U0001f41a",
 }
