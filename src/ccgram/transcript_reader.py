@@ -51,6 +51,7 @@ class _StableRead(NamedTuple):
     entries: list[dict]
     stat: Any
     reset_generation: bool
+    before_mtime: float | None = None
 
 
 class _GenerationCheck(NamedTuple):
@@ -338,8 +339,12 @@ class TranscriptReader:
                 # Replaced transcript: jump the parse position to EOF so the
                 # existing bytes are treated as already-notified history
                 # (incident 2026-08-17: never replay), and let the persisted
-                # watermark follow via commit_parsed_offsets().
-                tracked.parsed_offset = st.st_size
+                # watermark follow via commit_parsed_offsets(). Only valid
+                # for byte-offset providers — whole-file providers own their
+                # offset unit and replay protection, so their cursor must
+                # not be overwritten with a byte size.
+                if check_marker:
+                    tracked.parsed_offset = st.st_size
                 self._startup_file_boundaries.pop(session_id, None)
         return _GenerationCheck(changed and not consumed_intact, consumed_intact)
 
@@ -366,7 +371,15 @@ class TranscriptReader:
                 after.st_dev,
                 after.st_ino,
             )
-            rewritten_in_place = before.st_ctime_ns != after.st_ctime_ns
+            # Tearing detection is only meaningful for byte-stream reads. A
+            # whole-file provider returns a self-consistent snapshot and may
+            # legitimately write to its transcript during the read (the
+            # OpenCode mirror syncs new entries and mtime-bumps on EVERY
+            # read), so ctime churn must not invalidate the entries it just
+            # handed back — otherwise every such read is discarded forever.
+            rewritten_in_place = (
+                check_marker and before.st_ctime_ns != after.st_ctime_ns
+            )
             marker_changed = False
             saved = self._file_markers.get(session_id) if check_marker else None
             if saved is not None and saved[0] == start_offset:
@@ -378,15 +391,27 @@ class TranscriptReader:
                     return None
                 marker_changed = marker != saved[1]
             if same_generation and not rewritten_in_place and not marker_changed:
-                return _StableRead(entries, after, reset_generation)
+                return _StableRead(
+                    entries, after, reset_generation, before_mtime=before.st_mtime
+                )
             consumed_survived = check_marker and await self._consumed_prefix_intact(
                 session_id, start_offset, file_path, after
             )
             if consumed_survived:
                 # Concurrent append or metadata churn, not a replacement: the
                 # bytes already delivered survived, so keep this read.
-                return _StableRead(entries, after, reset_generation)
-            tracked.parsed_offset = after.st_size
+                return _StableRead(
+                    entries, after, reset_generation, before_mtime=before.st_mtime
+                )
+            if check_marker:
+                # Byte-offset providers: treat the existing bytes as
+                # already-notified history (incident 2026-08-17: never
+                # replay). Whole-file providers own their offset unit
+                # (message index, event seq, ...) — assigning a byte size
+                # would poison the cursor beyond the content tip and stall
+                # the session forever. Their cursor stays untouched; the
+                # next attempt re-reads with provider-level dedup.
+                tracked.parsed_offset = after.st_size
             self._startup_file_boundaries.pop(session_id, None)
             reset_generation = True
         return None
@@ -406,7 +431,18 @@ class TranscriptReader:
             )
         except OSError:
             return False
-        self._file_mtimes[session_id] = stable_stat.st_mtime
+        # Cache the pre-read mtime rather than the post-read one: a
+        # whole-file provider that bumps its transcript mtime during the
+        # read (the OpenCode mirror keepalive) must still present a newer
+        # mtime at the next poll, or the whole-file gate
+        # (current_mtime > last_mtime) closes after a single read and the
+        # session goes silent. For providers that never write during a read,
+        # before == after on a stable read, so behavior is unchanged.
+        self._file_mtimes[session_id] = (
+            stable_read.before_mtime
+            if stable_read.before_mtime is not None
+            else stable_stat.st_mtime
+        )
         self._file_generations[session_id] = (
             stable_stat.st_dev,
             stable_stat.st_ino,
@@ -656,7 +692,7 @@ class TranscriptReader:
             or stable_read is None
         ):
             return
-        new_entries, _, reset_during_read = stable_read
+        new_entries, _stat, reset_during_read, _before_mtime = stable_read
         committed = await self._commit_stable_read(
             session_id, tracked, file_path, stable_read
         )

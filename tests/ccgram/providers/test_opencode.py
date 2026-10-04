@@ -572,6 +572,63 @@ class TestTranscriptReading:
         assert messages2 == []
         assert offset2 == offset
 
+    def test_beyond_tip_cursor_rewinds_instead_of_stalling(
+        self, provider_env: tuple
+    ) -> None:
+        """A corrupt cursor past the event tip must rewind to the tip.
+
+        A poisoned offset (e.g. a byte size mixed into the seq domain by a
+        caller) would otherwise make ``seq > cursor`` empty forever: new
+        events stay invisible and the session goes silent. The sync rewinds
+        such a cursor to the tip so later events become visible again.
+        """
+        provider, db, mirror_root = provider_env
+        conn = _seed_session(db, "ses_1")
+        _seed_events(conn, "ses_1")  # tip at seq 8
+        conn.close()
+        mirror = mirror_root / "ses_1.jsonl"
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        mirror.write_text(
+            json.dumps(
+                {"type": "session_meta", "session_id": "ses_1", "cwd": "/tmp/repo"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        entries, offset = provider.read_transcript_file(str(mirror), 9999)
+        assert entries == []
+        assert offset == 8
+
+        conn = sqlite3.connect(db)
+        _insert_event(
+            conn,
+            "ses_1",
+            9,
+            "message.part.updated.1",
+            _part_event(
+                "ses_1",
+                {
+                    "id": "prt_late",
+                    "sessionID": "ses_1",
+                    "messageID": "msg_asst",
+                    "type": "text",
+                    "text": "late",
+                    "time": {"start": 3, "end": 4},
+                },
+            ),
+        )
+        conn.commit()
+        conn.close()
+        entries2, offset2 = provider.read_transcript_file(str(mirror), offset)
+        texts = [
+            e.get("part", {}).get("text")
+            for e in entries2
+            if e.get("type") == "opencode_part"
+        ]
+        assert "late" in texts
+        assert offset2 == 9
+
     def _seed_big_session(self, db: Path, parts: int) -> None:
         conn = sqlite3.connect(db)
         conn.execute(

@@ -1,11 +1,15 @@
 """Tests for transcript reader offset handling."""
 
+import json
 import os
+import time
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 from ccgram.idle_tracker import IdleTracker
 from ccgram.monitor_state import BacklogSkipIntent, MonitorState, TrackedSession
+from ccgram.providers.base import AgentMessage, MessageRole
 from ccgram.transcript_reader import TranscriptReader, _StableRead
 
 
@@ -490,3 +494,166 @@ async def test_replaced_smaller_transcript_resumes_from_eof_no_replay(
     tracked = state.get_session("sess-replaced")
     assert tracked is not None
     assert tracked.parsed_offset == session_file.stat().st_size
+
+
+def _patch_resolution(provider: object):
+    """Patch ``_resolve_provider_for_file`` in the exact ``__globals__``
+    namespace the reader methods use.
+
+    The test environment can hold duplicate module objects for the same file
+    (``ccgram.*`` and ``src.ccgram.*``), so a string- or module-object-based
+    patch may land on a namespace the class does not actually use. Patching
+    the function's own ``__globals__`` is instance-proof.
+    """
+    return patch.dict(
+        TranscriptReader._process_session_file.__globals__,
+        {"_resolve_provider_for_file": lambda _wid, _fp: provider},
+    )
+
+
+class _SelfSyncingWholeFileProvider:
+    """Whole-file provider double mimicking the OpenCode mirror pattern.
+
+    ``read_transcript_file`` appends pending entries to the transcript and
+    mtime-bumps the file on EVERY call (ctime churn) — legitimate behavior
+    that the mid-read rewrite detection (byte-stream providers only) must
+    not mistake for an in-flight file replacement.
+    """
+
+    capabilities = SimpleNamespace(
+        name="opencode",
+        supports_incremental_read=False,
+        supports_task_tracking=False,
+    )
+
+    def __init__(self, pending: dict[int, tuple[list[dict], int]]) -> None:
+        self._pending = pending
+        self.calls: list[int] = []
+
+    def read_transcript_file(
+        self, file_path: str, last_offset: int
+    ) -> tuple[list[dict], int]:
+        self.calls.append(last_offset)
+        entries, new_offset = self._pending.get(last_offset, ([], last_offset))
+        if entries:
+            with open(file_path, "a", encoding="utf-8") as fh:
+                for entry in entries:
+                    fh.write(json.dumps(entry) + "\n")
+        now = time.time() + 1.0
+        os.utime(file_path, (now, now))
+        return entries, new_offset
+
+    def parse_transcript_entries(
+        self, entries: list[dict], pending_tools: dict, cwd: str | None = None
+    ) -> tuple[list[AgentMessage], dict]:
+        return (
+            [
+                AgentMessage(
+                    text=str(entry.get("part", {}).get("text", "")),
+                    role=cast(MessageRole, str(entry.get("role", "assistant"))),
+                    content_type="text",
+                )
+                for entry in entries
+            ],
+            {},
+        )
+
+
+async def test_whole_file_provider_writing_during_read_still_delivers(
+    tmp_path,
+) -> None:
+    """A whole-file provider that syncs its transcript during the read (the
+    OpenCode mirror appends + mtime-bumps on every read) must not be
+    discarded by mid-read rewrite detection — that detection targets
+    byte-stream providers only. Discarding it drops every message before
+    parsing and stalls delivery forever."""
+    session_file = tmp_path / "mirror.jsonl"
+    session_file.write_text('{"type":"session_meta"}\n', newline="\n")
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession(
+            session_id="sess", file_path=str(session_file), last_byte_offset=6
+        )
+    )
+    reader = TranscriptReader(state, IdleTracker())
+    entry = {
+        "type": "opencode_part",
+        "role": "assistant",
+        "part": {"id": "prt_1", "type": "text", "text": "hello"},
+    }
+    provider = _SelfSyncingWholeFileProvider({6: ([entry], 13)})
+
+    messages = []
+    with _patch_resolution(provider):
+        await reader._process_session_file(
+            "sess", session_file, messages, window_id="@1"
+        )
+
+    assert [msg.text for msg in messages] == ["hello"]
+    tracked = state.get_session("sess")
+    assert tracked is not None
+    # The provider-owned cursor (event seq) must win — not the byte size
+    # that the byte-stream anti-replay reset would have assigned.
+    assert tracked.parsed_offset == 13
+
+
+async def test_whole_file_self_bump_keeps_poll_gate_open(tmp_path) -> None:
+    """A whole-file provider that mtime-bumps its transcript during a read
+    must still be re-read at the next poll: the cached mtime is the pre-read
+    one, so the bumped file mtime stays strictly newer and the whole-file
+    gate (current_mtime > last_mtime) re-opens instead of closing after a
+    single read."""
+    session_file = tmp_path / "mirror.jsonl"
+    session_file.write_text('{"type":"session_meta"}\n', newline="\n")
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession(
+            session_id="sess", file_path=str(session_file), last_byte_offset=6
+        )
+    )
+    reader = TranscriptReader(state, IdleTracker())
+    provider = _SelfSyncingWholeFileProvider({})
+
+    with _patch_resolution(provider):
+        await reader._process_session_file("sess", session_file, [], window_id="@1")
+        await reader._process_session_file("sess", session_file, [], window_id="@1")
+
+    assert provider.calls == [6, 6]
+
+
+async def test_whole_file_replacement_keeps_provider_cursor(tmp_path) -> None:
+    """Replacing a whole-file transcript between polls (new inode) must not
+    reset the provider-owned cursor to the file's byte size: the provider
+    re-reads the new file with its own cursor and dedups on its own level.
+    Assigning a byte size would poison the cursor beyond the content tip."""
+    session_file = tmp_path / "mirror.jsonl"
+    session_file.write_text('{"type":"session_meta"}\n', newline="\n")
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession(
+            session_id="sess", file_path=str(session_file), last_byte_offset=6
+        )
+    )
+    reader = TranscriptReader(state, IdleTracker())
+    entry = {
+        "type": "opencode_part",
+        "role": "assistant",
+        "part": {"id": "prt_1", "type": "text", "text": "fresh"},
+    }
+    provider = _SelfSyncingWholeFileProvider({6: ([entry], 13)})
+
+    with _patch_resolution(provider):
+        await reader._process_session_file("sess", session_file, [], window_id="@1")
+        replacement = tmp_path / "replacement.jsonl"
+        replacement.write_text('{"type":"session_meta"}\n', newline="\n")
+        replacement.replace(session_file)
+        messages = []
+        await reader._process_session_file(
+            "sess", session_file, messages, window_id="@1"
+        )
+
+    # The second read used the provider's own cursor (13), not a byte size.
+    assert provider.calls == [6, 13]
+    tracked = state.get_session("sess")
+    assert tracked is not None
+    assert tracked.parsed_offset == 13

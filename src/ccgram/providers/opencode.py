@@ -252,12 +252,40 @@ def _sync_opencode_events(
             if _hit_entry_cap(max_entries, entries) or len(rows) < _EVENT_BATCH_SIZE:
                 break
             cursor = last_seq
+        last_seq = _restore_cursor_if_past_tip(
+            conn, session_id, entries, since_seq, last_seq
+        )
     except (sqlite3.Error, OSError) as exc:
         logger.warning("opencode: event sync failed for %s: %s", session_id, exc)
         return [], since_seq
     finally:
         conn.close()
     return entries, last_seq
+
+
+def _restore_cursor_if_past_tip(
+    conn: sqlite3.Connection,
+    session_id: str,
+    entries: list[dict[str, Any]],
+    since_seq: int,
+    last_seq: int,
+) -> int:
+    """Return a cursor that sits past the event tip, rewound to the tip.
+
+    A cursor beyond the tip is corrupt state (e.g. an offset poisoned by a
+    caller mixing byte and seq units). ``seq > cursor`` then stays empty
+    forever: new events remain invisible and the session goes silent.
+    Rewinding to the tip makes later events visible again.
+    """
+    if entries:
+        return last_seq
+    row = conn.execute(
+        "SELECT MAX(seq) FROM event WHERE aggregate_id = ?", (session_id,)
+    ).fetchone()
+    tip = row[0] if row else None
+    if tip is not None and since_seq > tip:
+        return tip
+    return last_seq
 
 
 def _hit_entry_cap(max_entries: int | None, entries: list[dict[str, Any]]) -> bool:
